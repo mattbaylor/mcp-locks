@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Template for the mcp-locks reaper LaunchAgent.
+  Render via install.sh — placeholders below are substituted in-place.
+  Do not install this raw file; the installer produces the final plist.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.@@USER@@.mcp-locks-reap</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@MCP_LOCKS_BIN@@</string>
+        <string>reap</string>
+    </array>
+
+    <!-- Twice daily: 09:00 and 14:00 local time. Adjust if your usage
+         pattern is different (e.g. one large block of agent work per day). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>@@STATE_DIR@@/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@@STATE_DIR@@/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd starts with a sparse PATH. mcp-locks shells out to jq, ps,
+         pgrep, lsof, find — make sure they're discoverable. Adjust if your
+         tools live elsewhere (e.g. /opt/local for MacPorts). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>@@HOME@@</string>
+    </dict>
+</dict>
+</plist>

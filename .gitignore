@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Test scratch state (tests use $TMPDIR but allow opt-out into repo for debugging)
+test/.tmp/
+test/.coverage/
+
+# Editor cruft
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local-only install notes
+INSTALL_NOTES.local

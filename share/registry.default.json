@@ -1,0 +1,11 @@
+{
+  "_comment": "Default registry for mcp-locks. The CLI bootstraps a copy of this into ~/.config/mcp-locks/registry.json on first run if the file is missing. Edit the installed copy to suit your client config — add/remove instances as needed. The instance name should match the MCP server name in your opencode.json / claude config.",
+
+  "instances": {
+    "playwright":    { "kind": "playwright-mcp" },
+    "playwright2":   { "kind": "playwright-mcp" },
+    "playwright3":   { "kind": "playwright-mcp" },
+    "playwright4":   { "kind": "playwright-mcp" },
+    "figma-desktop": { "kind": "figma-desktop-mcp", "port": 3845 }
+  }
+}

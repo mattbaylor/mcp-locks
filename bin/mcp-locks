@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+# mcp-locks — cross-client checkout/lock manager for MCP instances that hold
+# exclusive OS resources (Chromium profile dirs, Figma desktop port, etc.).
+#
+# Designed to be invoked by agent prompts in OpenCode and Claude Code on the
+# same machine. State is host-global so claims are visible across clients
+# (including across sandboxed/containerized agent environments).
+#
+# Repo:    https://github.com/mattbaylor/mcp-locks
+# Docs:    docs/architecture.md, docs/design.md, docs/opencode-integration.md
+# License: MIT
+
+set -euo pipefail
+
+# ---- path resolution ----
+#
+# State and registry are HOST-GLOBAL so claims are visible across sandboxes
+# and across clients. Anchor on the real user's HOME, not whatever sandbox
+# HOME this script happens to run inside.
+#
+# Detection priority:
+#   1. MCP_LOCKS_HOME env var (escape hatch for tests / non-standard setups)
+#   2. /Users/${SUDO_USER:-$USER} on macOS, /home/$USER on Linux
+#   3. $HOME (fallback)
+_real_home() {
+  if [ -n "${MCP_LOCKS_HOME:-}" ]; then
+    echo "$MCP_LOCKS_HOME"
+    return
+  fi
+  local u="${SUDO_USER:-${USER:-}}"
+  if [ -n "$u" ]; then
+    if [ -d "/Users/$u" ]; then
+      echo "/Users/$u"; return
+    elif [ -d "/home/$u" ]; then
+      echo "/home/$u"; return
+    fi
+  fi
+  echo "$HOME"
+}
+REAL_HOME=$(_real_home)
+
+STATE_DIR="${MCP_LOCKS_STATE_DIR:-${REAL_HOME}/.local/state/mcp-locks}"
+STATE_FILE="${STATE_DIR}/state.json"
+LOCK_DIR="${STATE_DIR}/.lock"
+REAP_LOG="${STATE_DIR}/reap.log"
+REGISTRY_DIR="${MCP_LOCKS_REGISTRY_DIR:-${REAL_HOME}/.config/mcp-locks}"
+REGISTRY_FILE="${REGISTRY_DIR}/registry.json"
+
+DEFAULT_TTL="30m"
+
+mkdir -p "$STATE_DIR" "$REGISTRY_DIR"
+
+# Bootstrap registry if missing — default lockable MCP instances.
+if [ ! -f "$REGISTRY_FILE" ]; then
+  cat > "$REGISTRY_FILE" <<'EOF'
+{
+  "instances": {
+    "playwright":    { "kind": "playwright-mcp" },
+    "playwright2":   { "kind": "playwright-mcp" },
+    "playwright3":   { "kind": "playwright-mcp" },
+    "playwright4":   { "kind": "playwright-mcp" },
+    "figma-desktop": { "kind": "figma-desktop-mcp", "port": 3845 }
+  }
+}
+EOF
+fi
+
+# Bootstrap state file if missing or invalid.
+_init_state_if_needed() {
+  if [ ! -f "$STATE_FILE" ] || ! jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
+    local instances
+    instances=$(jq '.instances | to_entries | map({key: .key, value: {owner: null}}) | from_entries' "$REGISTRY_FILE")
+    local now
+    now=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+    jq -n --argjson instances "$instances" --arg now "$now" \
+      '{version: 1, instances: $instances, updated_at: $now}' > "$STATE_FILE"
+  fi
+}
+_init_state_if_needed
+
+# ---- locking (macOS-portable, mkdir-based) ----
+
+with_lock() {
+  local i=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    i=$((i+1))
+    if [ "$i" -gt 50 ]; then
+      echo "ERROR: could not acquire lock at $LOCK_DIR after 5s. Stale? rm -rf to clear." >&2
+      exit 3
+    fi
+    sleep 0.1
+  done
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  "$@"
+  local rc=$?
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  trap - EXIT
+  return $rc
+}
+
+# ---- helpers ----
+
+is_alive() {
+  local pid="$1"
+  [ -n "$pid" ] && [ "$pid" != "null" ] && kill -0 "$pid" 2>/dev/null
+}
+
+now_iso() {
+  date -u "+%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Parse a TTL like "30m", "2h", "45s" into seconds.
+ttl_to_seconds() {
+  local ttl="$1"
+  if [[ "$ttl" =~ ^([0-9]+)s$ ]]; then echo "${BASH_REMATCH[1]}"
+  elif [[ "$ttl" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]} * 60 ))
+  elif [[ "$ttl" =~ ^([0-9]+)h$ ]]; then echo $(( ${BASH_REMATCH[1]} * 3600 ))
+  elif [[ "$ttl" =~ ^([0-9]+)$ ]]; then echo "${ttl}"  # raw seconds
+  else
+    echo "ERROR: invalid TTL '$ttl' (use e.g. 30m, 2h, 45s)" >&2
+    return 1
+  fi
+}
+
+# Add N seconds to an ISO 8601 UTC timestamp.
+iso_plus_seconds() {
+  local base="$1" seconds="$2" base_epoch
+  base_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$base" "+%s" 2>/dev/null || echo 0)
+  date -u -r $(( base_epoch + seconds )) "+%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Compute age in human form from an ISO 8601 UTC timestamp.
+age_human() {
+  local started="$1" started_epoch now diff
+  started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started" "+%s" 2>/dev/null || echo 0)
+  now=$(date -u "+%s")
+  diff=$(( now - started_epoch ))
+  if [ "$diff" -lt 0 ]; then echo "future"
+  elif [ "$diff" -lt 60 ]; then echo "${diff}s"
+  elif [ "$diff" -lt 3600 ]; then echo "$((diff/60))m"
+  elif [ "$diff" -lt 86400 ]; then echo "$((diff/3600))h$(( (diff%3600)/60 ))m"
+  else echo "$((diff/86400))d"
+  fi
+}
+
+# Remaining TTL in seconds (negative if expired).
+ttl_remaining() {
+  local expires="$1" expires_epoch now
+  expires_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$expires" "+%s" 2>/dev/null || echo 0)
+  now=$(date -u "+%s")
+  echo $(( expires_epoch - now ))
+}
+
+ttl_remaining_human() {
+  local secs="$1"
+  if [ "$secs" -le 0 ]; then echo "EXPIRED"
+  elif [ "$secs" -lt 60 ]; then echo "${secs}s"
+  elif [ "$secs" -lt 3600 ]; then echo "$((secs/60))m"
+  else echo "$((secs/3600))h$(( (secs%3600)/60 ))m"
+  fi
+}
+
+# Detect the calling agent's owner ID.
+# Priority (each is a stable per-session identifier; PPID is the last resort):
+#   1. --owner explicit
+#   2. OPENCODE_RUN_ID — OpenCode's per-session UUID, exported into every tool shell
+#   3. OPENCODE_SESSION_ID — alternate / future env var name
+#   4. CLAUDECODE_SESSION_ID / CLAUDE_SESSION_ID — Claude Code equivalents
+#   5. <parent-process-name>:PPID — bare bash invocation
+detect_owner() {
+  if [ -n "${OPENCODE_RUN_ID:-}" ]; then
+    echo "opencode:${OPENCODE_RUN_ID}"
+  elif [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+    echo "opencode:${OPENCODE_SESSION_ID}"
+  elif [ -n "${CLAUDECODE_SESSION_ID:-}" ]; then
+    echo "claude:${CLAUDECODE_SESSION_ID}"
+  elif [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+    echo "claude:${CLAUDE_SESSION_ID}"
+  else
+    local parent_name
+    parent_name=$(ps -o comm= -p "$PPID" 2>/dev/null | xargs basename 2>/dev/null || echo "shell")
+    echo "${parent_name}:${PPID}"
+  fi
+}
+
+# Detect owner PID — the long-lived process we should monitor for liveness.
+# For OpenCode, that's OPENCODE_PID (the TUI/web process). For Claude Code,
+# fall back to a likely parent. Bash subshells (PPID) are last resort and very
+# short-lived — they die between tool calls — so the reaper only treats
+# dead-PID as a takeover signal when owner ID is also PPID-shaped.
+detect_owner_pid() {
+  if [ -n "${OPENCODE_PID:-}" ]; then
+    echo "$OPENCODE_PID"
+  elif [ -n "${CLAUDECODE_PID:-}" ]; then
+    echo "$CLAUDECODE_PID"
+  else
+    echo "$PPID"
+  fi
+}
+
+# Validate that an instance name is in the registry.
+validate_instance() {
+  local instance="$1"
+  if ! jq -e --arg i "$instance" '.instances | has($i)' "$REGISTRY_FILE" >/dev/null; then
+    echo "ERROR: '$instance' is not a registered MCP instance." >&2
+    echo "       Registered instances:" >&2
+    jq -r '.instances | keys[]' "$REGISTRY_FILE" | sed 's/^/         /' >&2
+    return 2
+  fi
+}
+
+# ---- subcommands ----
+
+cmd_list() {
+  local rows
+  # Use \x1F (Unit Separator) — non-whitespace, won't appear in any value.
+  rows=$(jq -r '.instances | to_entries[] | [.key, (.value.owner // ""), (.value.owner_pid // 0 | tostring), (.value.claimed_at // ""), (.value.expires_at // ""), (.value.note // "")] | join("\u001f")' "$STATE_FILE")
+  printf "%-15s %-30s %-7s %-10s %-10s %s\n" "INSTANCE" "OWNER" "PID" "AGE" "TTL" "NOTE"
+  if [ -z "$rows" ]; then
+    echo "(no instances configured)"
+    return 0
+  fi
+  while IFS=$'\x1f' read -r instance owner owner_pid claimed_at expires_at note; do
+    local age ttl status_marker
+    if [ -z "$owner" ]; then
+      printf "%-15s %-30s %-7s %-10s %-10s %s\n" "$instance" "(free)" "-" "-" "-" ""
+      continue
+    fi
+    age=$(age_human "$claimed_at")
+    local remaining
+    remaining=$(ttl_remaining "$expires_at")
+    ttl=$(ttl_remaining_human "$remaining")
+    if [ "$remaining" -le 0 ]; then
+      status_marker=" [EXPIRED]"
+    elif ! is_alive "$owner_pid"; then
+      status_marker=" [DEAD PID]"
+    else
+      status_marker=""
+    fi
+    printf "%-15s %-30s %-7s %-10s %-10s %s%s\n" \
+      "$instance" "${owner:0:30}" "$owner_pid" "$age" "$ttl" "$note" "$status_marker"
+  done <<< "$rows"
+}
+
+cmd_who() {
+  local instance="$1"
+  validate_instance "$instance" || return $?
+
+  local entry
+  entry=$(jq -c --arg i "$instance" '.instances[$i]' "$STATE_FILE")
+  local owner
+  owner=$(echo "$entry" | jq -r '.owner // empty')
+
+  if [ -z "$owner" ]; then
+    echo "$instance — free"
+    return 1
+  fi
+
+  local owner_pid claimed_at expires_at note remaining ttl age
+  owner_pid=$(echo "$entry"   | jq -r '.owner_pid // 0')
+  claimed_at=$(echo "$entry"  | jq -r '.claimed_at // ""')
+  expires_at=$(echo "$entry"  | jq -r '.expires_at // ""')
+  note=$(echo "$entry"        | jq -r '.note // ""')
+  age=$(age_human "$claimed_at")
+  remaining=$(ttl_remaining "$expires_at")
+  ttl=$(ttl_remaining_human "$remaining")
+
+  local marker=""
+  if [ "$remaining" -le 0 ]; then
+    marker=" [EXPIRED]"
+  elif ! is_alive "$owner_pid"; then
+    marker=" [DEAD PID $owner_pid]"
+  fi
+
+  echo "$instance — owned by $owner (age $age, TTL $ttl)$marker"
+  [ -n "$note" ] && echo "  note: $note"
+  return 0
+}
+
+# Internal: actually mutate the state file for claim.
+_do_claim() {
+  local instance="$1" owner="$2" owner_pid="$3" ttl_seconds="$4" note="$5"
+  local now expires
+  now=$(now_iso)
+  expires=$(iso_plus_seconds "$now" "$ttl_seconds")
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg i "$instance" \
+     --arg owner "$owner" \
+     --argjson owner_pid "$owner_pid" \
+     --arg claimed_at "$now" \
+     --arg expires_at "$expires" \
+     --arg note "$note" \
+     --arg updated_at "$now" \
+     '.instances[$i] = {owner: $owner, owner_pid: $owner_pid, claimed_at: $claimed_at, expires_at: $expires_at, note: $note}
+      | .updated_at = $updated_at' \
+     "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+cmd_claim() {
+  local instance="" owner="" ttl="$DEFAULT_TTL" note="" force=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --owner) owner="$2"; shift 2 ;;
+      --ttl) ttl="$2"; shift 2 ;;
+      --note) note="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -*) echo "unknown flag: $1" >&2; return 1 ;;
+      *) if [ -z "$instance" ]; then instance="$1"; shift; else echo "unexpected arg: $1" >&2; return 1; fi ;;
+    esac
+  done
+  if [ -z "$instance" ]; then
+    echo "ERROR: missing <instance> arg" >&2
+    return 1
+  fi
+  validate_instance "$instance" || return $?
+
+  [ -z "$owner" ] && owner=$(detect_owner)
+  local owner_pid
+  owner_pid=$(detect_owner_pid)
+  local ttl_seconds
+  ttl_seconds=$(ttl_to_seconds "$ttl") || return 1
+
+  # Inspect current state under the lock to make decisions atomic with the write.
+  _claim_locked() {
+    local current_owner current_pid current_expires remaining
+    current_owner=$(jq -r --arg i "$instance" '.instances[$i].owner // empty' "$STATE_FILE")
+    current_pid=$(jq -r --arg i "$instance" '.instances[$i].owner_pid // 0' "$STATE_FILE")
+    current_expires=$(jq -r --arg i "$instance" '.instances[$i].expires_at // empty' "$STATE_FILE")
+
+    if [ -n "$current_owner" ]; then
+      remaining=$(ttl_remaining "$current_expires")
+      if [ "$current_owner" = "$owner" ]; then
+        # Re-claim: refresh TTL, keep note unless explicitly overridden.
+        local existing_note
+        existing_note=$(jq -r --arg i "$instance" '.instances[$i].note // ""' "$STATE_FILE")
+        [ -z "$note" ] && note="$existing_note"
+        _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
+        echo "refreshed claim on $instance (owner=$owner, TTL=$ttl)"
+        return 0
+      fi
+      # Different owner. Is their claim still valid?
+      # PID-liveness gate only matters for opencode:/claude: owners (long-lived
+      # session host). Shell/PPID owners are treated as valid until TTL expires.
+      local pid_valid=1
+      if [[ "$current_owner" =~ ^(opencode|claude): ]] && ! is_alive "$current_pid"; then
+        pid_valid=0
+      fi
+      if [ "$remaining" -gt 0 ] && [ "$pid_valid" = "1" ]; then
+        if [ "$force" = "1" ]; then
+          echo "WARN: forcing claim — was owned by $current_owner (PID $current_pid)" >&2
+          _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
+          echo "force-claimed $instance (owner=$owner, TTL=$ttl)"
+          return 0
+        fi
+        local age ttl_h
+        age=$(age_human "$(jq -r --arg i "$instance" '.instances[$i].claimed_at' "$STATE_FILE")")
+        ttl_h=$(ttl_remaining_human "$remaining")
+        echo "DENIED: $instance is owned by $current_owner (PID $current_pid, age $age, TTL $ttl_h)" >&2
+        echo "        run \`mcp-locks claim $instance --force\` to steal, or \`mcp-locks who $instance\` for detail" >&2
+        return 2
+      fi
+      # Owner expired or PID dead — implicit takeover.
+      echo "WARN: $instance had a stale claim by $current_owner; taking over" >&2
+    fi
+    _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
+    echo "claimed $instance (owner=$owner, TTL=$ttl)"
+    return 0
+  }
+  with_lock _claim_locked
+}
+
+_do_release() {
+  local instance="$1"
+  local tmp now
+  now=$(now_iso)
+  tmp=$(mktemp)
+  jq --arg i "$instance" --arg updated_at "$now" \
+     '.instances[$i] = {owner: null} | .updated_at = $updated_at' \
+     "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+cmd_release() {
+  local instance="" owner="" force=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --owner) owner="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -*) echo "unknown flag: $1" >&2; return 1 ;;
+      *) if [ -z "$instance" ]; then instance="$1"; shift; else echo "unexpected arg: $1" >&2; return 1; fi ;;
+    esac
+  done
+  if [ -z "$instance" ]; then
+    echo "ERROR: missing <instance> arg" >&2
+    return 1
+  fi
+  validate_instance "$instance" || return $?
+
+  [ -z "$owner" ] && owner=$(detect_owner)
+
+  _release_locked() {
+    local current_owner
+    current_owner=$(jq -r --arg i "$instance" '.instances[$i].owner // empty' "$STATE_FILE")
+    if [ -z "$current_owner" ]; then
+      echo "$instance was already free"
+      return 0
+    fi
+    if [ "$current_owner" != "$owner" ] && [ "$force" != "1" ]; then
+      echo "ERROR: $instance is owned by $current_owner, not $owner. Use --force to override." >&2
+      return 2
+    fi
+    _do_release "$instance"
+    echo "released $instance (was owned by $current_owner)"
+  }
+  with_lock _release_locked
+}
+
+# Reaper steps. Each returns the count of things it did.
+_reap_log() {
+  local msg="$1"
+  echo "$(now_iso) $msg" >> "$REAP_LOG"
+}
+
+_reap_expired_and_dead() {
+  local cleared=0
+  local instances
+  instances=$(jq -r '.instances | to_entries[] | select(.value.owner != null) | .key' "$STATE_FILE")
+  for instance in $instances; do
+    local owner owner_pid expires_at remaining
+    owner=$(jq -r --arg i "$instance" '.instances[$i].owner // ""' "$STATE_FILE")
+    owner_pid=$(jq -r --arg i "$instance" '.instances[$i].owner_pid // 0' "$STATE_FILE")
+    expires_at=$(jq -r --arg i "$instance" '.instances[$i].expires_at // ""' "$STATE_FILE")
+    remaining=$(ttl_remaining "$expires_at")
+
+    if [ "$remaining" -le 0 ]; then
+      _do_release "$instance"
+      _reap_log "expired-claim cleared: $instance (was owner=$owner)"
+      cleared=$((cleared + 1))
+      continue
+    fi
+    # PID-liveness reap only for claims tied to a long-lived process
+    # (opencode/claude session IDs use OPENCODE_PID/CLAUDECODE_PID, which is
+    # the TUI/web process; if that's gone, the session is genuinely gone).
+    # Bash/PPID-based owners always have ephemeral PIDs — don't reap on
+    # those; let TTL handle it.
+    if [ "$owner_pid" -gt 0 ] && ! is_alive "$owner_pid"; then
+      if [[ "$owner" =~ ^(opencode|claude): ]]; then
+        _do_release "$instance"
+        _reap_log "dead-PID claim cleared: $instance (owner=$owner, PID $owner_pid was the session host)"
+        cleared=$((cleared + 1))
+      fi
+    fi
+  done
+  echo "$cleared"
+}
+
+_reap_chromium_orphans() {
+  # Kill mcp-chrome-* Chromium processes whose parent is gone.
+  local killed=0
+  local pids
+  pids=$(pgrep -f 'mcp-chrome-' 2>/dev/null || true)
+  for pid in $pids; do
+    local ppid
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
+    if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ]; then
+      # Parent is init/launchd or gone — orphaned.
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 0.5
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        _reap_log "killed orphan mcp-chrome PID $pid"
+        killed=$((killed + 1))
+      fi
+    fi
+  done
+  echo "$killed"
+}
+
+_reap_stale_singleton_locks() {
+  # Remove SingletonLock files in mcp-chrome-* dirs whose recorded PID is dead.
+  local removed=0
+  local cache_root="${REAL_HOME}/Library/Caches/ms-playwright"
+  [ -d "$cache_root" ] || { echo "$removed"; return; }
+  local lockfile
+  while IFS= read -r lockfile; do
+    [ -z "$lockfile" ] && continue
+    # SingletonLock is a symlink like "hostname-PID"; the link target tells us the PID.
+    local target pid
+    target=$(readlink "$lockfile" 2>/dev/null || echo "")
+    pid="${target##*-}"
+    if [ -n "$pid" ] && ! is_alive "$pid"; then
+      rm -f "$lockfile" 2>/dev/null && {
+        _reap_log "removed stale SingletonLock: $lockfile (PID $pid dead)"
+        removed=$((removed + 1))
+      }
+    fi
+  done < <(find "$cache_root" -maxdepth 2 -name 'SingletonLock' 2>/dev/null)
+  echo "$removed"
+}
+
+_reap_truncate_log() {
+  # Keep last 7 days of reap.log entries.
+  [ -f "$REAP_LOG" ] || return 0
+  local cutoff
+  cutoff=$(date -u -v-7d "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u "+%Y-%m-%dT%H:%M:%SZ")
+  local tmp
+  tmp=$(mktemp)
+  awk -v cutoff="$cutoff" '$1 >= cutoff' "$REAP_LOG" > "$tmp" 2>/dev/null || cp "$REAP_LOG" "$tmp"
+  mv "$tmp" "$REAP_LOG"
+}
+
+cmd_reap() {
+  local started cleared killed removed
+  started=$(now_iso)
+  _reap_log "=== reap started ==="
+
+  cleared=$(with_lock _reap_expired_and_dead)
+  killed=$(_reap_chromium_orphans)
+  removed=$(_reap_stale_singleton_locks)
+  _reap_truncate_log
+
+  _reap_log "=== reap finished: $cleared claims cleared, $killed orphans killed, $removed locks removed ==="
+  echo "reap complete: $cleared claims cleared, $killed Chromium orphans killed, $removed stale SingletonLocks removed"
+  echo "log: $REAP_LOG"
+}
+
+cmd_doctor() {
+  echo "mcp-locks doctor"
+  echo "  state file:    $STATE_FILE"
+  if [ -f "$STATE_FILE" ]; then
+    local age_secs
+    age_secs=$(( $(date -u "+%s") - $(stat -f "%m" "$STATE_FILE" 2>/dev/null || echo 0) ))
+    echo "  state mtime:   $((age_secs / 60))m ago"
+  else
+    echo "  state mtime:   MISSING"
+  fi
+  echo "  registry:      $REGISTRY_FILE"
+  echo "  reap log:      $REAP_LOG"
+  echo ""
+
+  local total_claimed expired dead_pid
+  total_claimed=$(jq '.instances | to_entries | map(select(.value.owner != null)) | length' "$STATE_FILE")
+  echo "  active claims: $total_claimed"
+
+  expired=0
+  dead_pid=0
+  while IFS=$'\x1f' read -r instance expires_at owner_pid; do
+    [ -z "$instance" ] && continue
+    local remaining
+    remaining=$(ttl_remaining "$expires_at")
+    [ "$remaining" -le 0 ] && expired=$((expired + 1))
+    [ "$owner_pid" != "0" ] && ! is_alive "$owner_pid" && dead_pid=$((dead_pid + 1))
+  done < <(jq -r '.instances | to_entries[] | select(.value.owner != null) | [.key, (.value.expires_at // ""), (.value.owner_pid // 0 | tostring)] | join("\u001f")' "$STATE_FILE")
+
+  echo "  expired:       $expired"
+  echo "  dead-PID:      $dead_pid"
+
+  # Chromium-side checks. `pgrep` exits 1 when nothing matches; with pipefail
+  # that would propagate through the pipeline and `set -e` would kill the
+  # function. `|| true` keeps the count at 0 in that case.
+  local cache_root="${REAL_HOME}/Library/Caches/ms-playwright"
+  local lock_count=0 chrome_count=0
+  if [ -d "$cache_root" ]; then
+    lock_count=$(find "$cache_root" -maxdepth 2 -name 'SingletonLock' 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+  fi
+  chrome_count=$( { pgrep -f 'mcp-chrome-' 2>/dev/null || true; } | wc -l | tr -d ' ')
+  # Also detect --isolated profile dirs (under /tmp per playwright/mcp >= 0.0.30)
+  local isolated_count
+  isolated_count=$( { pgrep -f 'playwright_chromiumdev_profile-' 2>/dev/null || true; } | wc -l | tr -d ' ')
+  echo "  SingletonLocks:  $lock_count present (shared profile, pre-isolated)"
+  echo "  mcp-chrome PIDs: $chrome_count running (shared profile, pre-isolated)"
+  echo "  isolated PIDs:   $isolated_count running (--isolated profile dirs)"
+
+  if [ "$expired" -gt 0 ] || [ "$dead_pid" -gt 0 ]; then
+    echo ""
+    echo "  → reap recommended: \`mcp-locks reap\`"
+  fi
+}
+
+usage() {
+  cat <<EOF
+mcp-locks — cross-client lock manager for MCP instances
+
+Usage:
+  mcp-locks list                                       # show all instances + owners
+  mcp-locks who <instance>                             # detail for one instance
+  mcp-locks claim <instance> [--owner ID] [--ttl 30m] [--note ...] [--force]
+                                                       # acquire (or refresh) a lock
+  mcp-locks release <instance> [--owner ID] [--force]  # release a lock
+  mcp-locks reap                                       # clean up expired claims + orphans
+  mcp-locks doctor                                     # show health + recommend actions
+
+Defaults:
+  TTL:   ${DEFAULT_TTL}
+  Owner: auto-detected (OPENCODE_SESSION_ID > CLAUDECODE_SESSION_ID > <shell>:PPID)
+
+Files:
+  registry: $REGISTRY_FILE
+  state:    $STATE_FILE
+  reaplog:  $REAP_LOG
+
+Exit codes:
+  0  success
+  1  usage error
+  2  denied (e.g. claim on owned instance, release with wrong owner, unknown instance)
+  3  lock acquisition timeout
+
+Docs: https://github.com/mattbaylor/mcp-locks  (TODO: update once pushed)
+EOF
+}
+
+case "${1:-}" in
+  list)    shift; cmd_list "$@" ;;
+  who)     shift; cmd_who "$@" ;;
+  claim)   shift; cmd_claim "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  reap)    shift; cmd_reap "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "unknown subcommand: $1" >&2; usage; exit 1 ;;
+esac
