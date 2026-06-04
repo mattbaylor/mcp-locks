@@ -608,7 +608,7 @@ Exit codes:
   2  denied (e.g. claim on owned instance, release with wrong owner, unknown instance)
   3  lock acquisition timeout
 
-Docs: https://github.com/mattbaylor/mcp-locks  (TODO: update once pushed)
+Docs: https://github.com/mattbaylor/mcp-locks
 EOF
 }
 
