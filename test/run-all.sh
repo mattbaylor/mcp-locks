@@ -20,6 +20,7 @@ TESTS=(
   test-claim-release.sh
   test-reaper.sh
   test-owner-detect.sh
+  test-json-output.sh
 )
 
 pass=0
