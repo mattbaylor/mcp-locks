@@ -98,14 +98,27 @@ mcp-locks claim <instance> [--owner ID] [--ttl 30m] [--note "..."] [--force]
 mcp-locks release <instance> [--owner ID] [--force]
 mcp-locks reap                                           # clean up expired + orphans
 mcp-locks doctor                                         # health + recommendations
+mcp-locks kill --orphans                                 # kill orphaned playwright-mcp Chromiums (subset of reap)
+mcp-locks kill --all --idle-only                         # kill all playwright-mcp Chromiums IFF no instance is claimed
+mcp-locks kill --all --force                             # nuclear: kill all playwright-mcp Chromiums regardless of claims
 ```
 
 Exit codes:
 
 - `0` success
 - `1` usage error
-- `2` denied (owned by someone else, unknown instance, wrong owner)
+- `2` denied (owned by someone else, unknown instance, wrong owner; or `kill --idle-only` refused because of active claims)
 - `3` state lock acquisition timeout
+
+### Killing Playwright Chromiums on demand
+
+Each `@playwright/mcp` server lazily spawns a Chromium on first browser use, and that Chromium stays alive for the life of the MCP server process. Across opencode restarts these can accumulate, and you sometimes want a single wedged Chromium recycled mid-session. The `kill` subcommand handles the bulk-cleanup cases:
+
+- **`mcp-locks kill --all --idle-only`** — safe default. Refuses (exit 2) if any instance is currently claimed in mcp-locks state. If all instances are free, kills every Chromium whose command line matches the Playwright-MCP profile-dir convention (`mcp-chrome-*` or `playwright_chromiumdev_profile-*`). Use end-of-day or after a known-clean checkpoint.
+- **`mcp-locks kill --all --force`** — nuclear. Kills every matching Chromium regardless of claim state. Use when you're sure nothing is in flight, or to recover from a stuck claim.
+- **`mcp-locks kill --orphans`** — kills only Chromiums whose parent process is gone (PPID = init/launchd). Subset of what `reap` already does; exposed standalone for cron / launchd / on-demand use.
+
+**Not yet implemented (v1):** `mcp-locks kill <instance>` — targeted single-slot kill. Returns a clear error explaining the limitation. The blocker is that `@playwright/mcp` chooses random profile-dir names that don't encode the mcp-locks instance slot, and the MCP server's command line (as spawned by opencode) doesn't either, so there's no reliable way to map slot → PID from the process table alone. The fix is to track PIDs in mcp-locks state on first browser activity; tracked as a follow-up.
 
 ### JSON output for programmatic callers
 

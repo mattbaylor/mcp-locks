@@ -21,6 +21,7 @@ TESTS=(
   test-reaper.sh
   test-owner-detect.sh
   test-json-output.sh
+  test-kill.sh
 )
 
 pass=0
