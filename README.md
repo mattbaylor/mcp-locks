@@ -107,6 +107,30 @@ Exit codes:
 - `2` denied (owned by someone else, unknown instance, wrong owner)
 - `3` state lock acquisition timeout
 
+### JSON output for programmatic callers
+
+Pass `--json` (before or after the subcommand) to emit a structured envelope on stdout instead of human-readable text. Useful for MCP wrappers, CI checks, and any script that needs to parse results:
+
+```
+mcp-locks --json list
+mcp-locks --json claim playwright --ttl 5m --note "session X"
+mcp-locks claim playwright --json  # equivalent
+```
+
+Envelope shape:
+
+```json
+// success
+{ "ok": true, "data": { ... command-specific ... } }
+
+// denied / error
+{ "ok": false, "error": "denied", "denied": { "current_owner": "...", "ttl_remaining_seconds": 1234, ... } }
+{ "ok": false, "error": "owner_mismatch", "denied": { ... } }
+{ "ok": false, "error": "instance 'foo' is not registered" }
+```
+
+Diagnostics (`WARN:` / `ERROR:` lines) still go to stderr in both modes. Exit codes are unchanged.
+
 ### Sub-agents
 
 Parent claims, dispatches the sub-agent with an explicit instance assignment, sub-agent doesn't claim/release. This avoids a sub-agent claim expiring mid-work because its TTL was shorter than the parent's task.

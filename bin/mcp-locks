@@ -209,9 +209,86 @@ validate_instance() {
   fi
 }
 
+# ---- output mode ----
+#
+# JSON_MODE is set to 1 by `--json` at the top level (see dispatch below).
+# When enabled, subcommands emit a structured envelope on stdout instead of
+# human-readable text:
+#
+#   { "ok": true|false, "data": <subcommand-specific>, "error": "<msg>" }
+#
+# Diagnostics (WARN/ERROR) still go to stderr in both modes so callers can
+# preserve human-debuggable logs. Exit codes are unchanged.
+JSON_MODE=0
+
+# Emit a success envelope. Arg is a jq-buildable JSON value (e.g. from `jq -n`).
+_emit_ok() {
+  local data="$1"
+  jq -n --argjson data "$data" '{ok: true, data: $data}'
+}
+
+# Emit an error envelope. Arg is a string message.
+_emit_err() {
+  local msg="$1"
+  jq -n --arg msg "$msg" '{ok: false, error: $msg}'
+}
+
 # ---- subcommands ----
 
 cmd_list() {
+  if [ "$JSON_MODE" = "1" ]; then
+    # Build a JSON array of instance records, each annotated with computed
+    # fields (age_seconds, ttl_remaining_seconds, alive, status).
+    local now_epoch
+    now_epoch=$(date -u "+%s")
+    local data
+    data=$(jq --argjson now "$now_epoch" '
+      .instances | to_entries | map({
+        instance: .key,
+        owner: (.value.owner // null),
+        owner_pid: (.value.owner_pid // null),
+        claimed_at: (.value.claimed_at // null),
+        expires_at: (.value.expires_at // null),
+        note: (.value.note // null)
+      })
+    ' "$STATE_FILE")
+    # Annotate each row with age/ttl/alive/status in a second pass that uses
+    # the bash helpers (jq can't shell out cleanly). Build a parallel array.
+    local annotated="[]"
+    local len i
+    len=$(echo "$data" | jq 'length')
+    for ((i=0; i<len; i++)); do
+      local row owner owner_pid claimed_at expires_at
+      row=$(echo "$data" | jq ".[$i]")
+      owner=$(echo "$row" | jq -r '.owner // empty')
+      owner_pid=$(echo "$row" | jq -r '.owner_pid // 0')
+      claimed_at=$(echo "$row" | jq -r '.claimed_at // empty')
+      expires_at=$(echo "$row" | jq -r '.expires_at // empty')
+      local age_seconds=null ttl_seconds=null alive=null status="free"
+      if [ -n "$owner" ]; then
+        local claimed_epoch expires_epoch
+        claimed_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$claimed_at" "+%s" 2>/dev/null || echo 0)
+        expires_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$expires_at" "+%s" 2>/dev/null || echo 0)
+        age_seconds=$(( now_epoch - claimed_epoch ))
+        ttl_seconds=$(( expires_epoch - now_epoch ))
+        if is_alive "$owner_pid"; then alive="true"; else alive="false"; fi
+        if [ "$ttl_seconds" -le 0 ]; then status="expired"
+        elif [ "$alive" = "false" ]; then status="dead_pid"
+        else status="claimed"
+        fi
+      fi
+      annotated=$(echo "$annotated" | jq \
+        --argjson row "$row" \
+        --argjson age "$age_seconds" \
+        --argjson ttl "$ttl_seconds" \
+        --argjson alive "$alive" \
+        --arg status "$status" \
+        '. + [$row + {age_seconds: $age, ttl_remaining_seconds: $ttl, alive: $alive, status: $status}]')
+    done
+    _emit_ok "$annotated"
+    return 0
+  fi
+
   local rows
   # Use \x1F (Unit Separator) — non-whitespace, won't appear in any value.
   rows=$(jq -r '.instances | to_entries[] | [.key, (.value.owner // ""), (.value.owner_pid // 0 | tostring), (.value.claimed_at // ""), (.value.expires_at // ""), (.value.note // "")] | join("\u001f")' "$STATE_FILE")
@@ -244,7 +321,12 @@ cmd_list() {
 
 cmd_who() {
   local instance="$1"
-  validate_instance "$instance" || return $?
+  local rc
+  rc=0; validate_instance "$instance" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$JSON_MODE" = "1" ] && _emit_err "instance '$instance' is not registered"
+    return "$rc"
+  fi
 
   local entry
   entry=$(jq -c --arg i "$instance" '.instances[$i]' "$STATE_FILE")
@@ -252,7 +334,11 @@ cmd_who() {
   owner=$(echo "$entry" | jq -r '.owner // empty')
 
   if [ -z "$owner" ]; then
-    echo "$instance — free"
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_ok "$(jq -n --arg i "$instance" '{instance: $i, owner: null, status: "free"}')"
+    else
+      echo "$instance — free"
+    fi
     return 1
   fi
 
@@ -264,6 +350,33 @@ cmd_who() {
   age=$(age_human "$claimed_at")
   remaining=$(ttl_remaining "$expires_at")
   ttl=$(ttl_remaining_human "$remaining")
+
+  local alive status
+  if is_alive "$owner_pid"; then alive=true; else alive=false; fi
+  if [ "$remaining" -le 0 ]; then status="expired"
+  elif [ "$alive" = "false" ]; then status="dead_pid"
+  else status="claimed"
+  fi
+
+  if [ "$JSON_MODE" = "1" ]; then
+    local now_epoch claimed_epoch age_secs
+    now_epoch=$(date -u "+%s")
+    claimed_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$claimed_at" "+%s" 2>/dev/null || echo 0)
+    age_secs=$(( now_epoch - claimed_epoch ))
+    _emit_ok "$(jq -n \
+      --arg instance "$instance" \
+      --arg owner "$owner" \
+      --argjson owner_pid "$owner_pid" \
+      --arg claimed_at "$claimed_at" \
+      --arg expires_at "$expires_at" \
+      --argjson age_seconds "$age_secs" \
+      --argjson ttl_remaining_seconds "$remaining" \
+      --argjson alive "$alive" \
+      --arg note "$note" \
+      --arg status "$status" \
+      '{instance: $instance, owner: $owner, owner_pid: $owner_pid, claimed_at: $claimed_at, expires_at: $expires_at, age_seconds: $age_seconds, ttl_remaining_seconds: $ttl_remaining_seconds, alive: $alive, note: $note, status: $status}')"
+    return 0
+  fi
 
   local marker=""
   if [ "$remaining" -le 0 ]; then
@@ -313,15 +426,39 @@ cmd_claim() {
   done
   if [ -z "$instance" ]; then
     echo "ERROR: missing <instance> arg" >&2
+    [ "$JSON_MODE" = "1" ] && _emit_err "missing <instance> arg"
     return 1
   fi
-  validate_instance "$instance" || return $?
+  local rc
+  rc=0; validate_instance "$instance" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$JSON_MODE" = "1" ] && _emit_err "instance '$instance' is not registered"
+    return "$rc"
+  fi
 
   [ -z "$owner" ] && owner=$(detect_owner)
   local owner_pid
   owner_pid=$(detect_owner_pid)
   local ttl_seconds
-  ttl_seconds=$(ttl_to_seconds "$ttl") || return 1
+  if ! ttl_seconds=$(ttl_to_seconds "$ttl"); then
+    [ "$JSON_MODE" = "1" ] && _emit_err "invalid TTL '$ttl'"
+    return 1
+  fi
+
+  _emit_claim_ok() {
+    local action="$1"  # claimed | refreshed | force_claimed
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_ok "$(jq -n \
+        --arg instance "$instance" \
+        --arg owner "$owner" \
+        --argjson owner_pid "$owner_pid" \
+        --argjson ttl_seconds "$ttl_seconds" \
+        --arg ttl "$ttl" \
+        --arg note "$note" \
+        --arg action "$action" \
+        '{instance: $instance, owner: $owner, owner_pid: $owner_pid, ttl: $ttl, ttl_seconds: $ttl_seconds, note: $note, action: $action}')"
+    fi
+  }
 
   # Inspect current state under the lock to make decisions atomic with the write.
   _claim_locked() {
@@ -338,7 +475,11 @@ cmd_claim() {
         existing_note=$(jq -r --arg i "$instance" '.instances[$i].note // ""' "$STATE_FILE")
         [ -z "$note" ] && note="$existing_note"
         _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
-        echo "refreshed claim on $instance (owner=$owner, TTL=$ttl)"
+        if [ "$JSON_MODE" = "1" ]; then
+          _emit_claim_ok "refreshed"
+        else
+          echo "refreshed claim on $instance (owner=$owner, TTL=$ttl)"
+        fi
         return 0
       fi
       # Different owner. Is their claim still valid?
@@ -352,7 +493,11 @@ cmd_claim() {
         if [ "$force" = "1" ]; then
           echo "WARN: forcing claim — was owned by $current_owner (PID $current_pid)" >&2
           _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
-          echo "force-claimed $instance (owner=$owner, TTL=$ttl)"
+          if [ "$JSON_MODE" = "1" ]; then
+            _emit_claim_ok "force_claimed"
+          else
+            echo "force-claimed $instance (owner=$owner, TTL=$ttl)"
+          fi
           return 0
         fi
         local age ttl_h
@@ -360,13 +505,27 @@ cmd_claim() {
         ttl_h=$(ttl_remaining_human "$remaining")
         echo "DENIED: $instance is owned by $current_owner (PID $current_pid, age $age, TTL $ttl_h)" >&2
         echo "        run \`mcp-locks claim $instance --force\` to steal, or \`mcp-locks who $instance\` for detail" >&2
+        if [ "$JSON_MODE" = "1" ]; then
+          jq -n \
+            --arg instance "$instance" \
+            --arg current_owner "$current_owner" \
+            --argjson current_pid "$current_pid" \
+            --arg age "$age" \
+            --arg ttl_remaining "$ttl_h" \
+            --argjson ttl_remaining_seconds "$remaining" \
+            '{ok: false, error: "denied", denied: {instance: $instance, current_owner: $current_owner, current_pid: $current_pid, age: $age, ttl_remaining: $ttl_remaining, ttl_remaining_seconds: $ttl_remaining_seconds}}'
+        fi
         return 2
       fi
       # Owner expired or PID dead — implicit takeover.
       echo "WARN: $instance had a stale claim by $current_owner; taking over" >&2
     fi
     _do_claim "$instance" "$owner" "$owner_pid" "$ttl_seconds" "$note"
-    echo "claimed $instance (owner=$owner, TTL=$ttl)"
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_claim_ok "claimed"
+    else
+      echo "claimed $instance (owner=$owner, TTL=$ttl)"
+    fi
     return 0
   }
   with_lock _claim_locked
@@ -395,9 +554,15 @@ cmd_release() {
   done
   if [ -z "$instance" ]; then
     echo "ERROR: missing <instance> arg" >&2
+    [ "$JSON_MODE" = "1" ] && _emit_err "missing <instance> arg"
     return 1
   fi
-  validate_instance "$instance" || return $?
+  local rc
+  rc=0; validate_instance "$instance" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$JSON_MODE" = "1" ] && _emit_err "instance '$instance' is not registered"
+    return "$rc"
+  fi
 
   [ -z "$owner" ] && owner=$(detect_owner)
 
@@ -405,15 +570,36 @@ cmd_release() {
     local current_owner
     current_owner=$(jq -r --arg i "$instance" '.instances[$i].owner // empty' "$STATE_FILE")
     if [ -z "$current_owner" ]; then
-      echo "$instance was already free"
+      if [ "$JSON_MODE" = "1" ]; then
+        _emit_ok "$(jq -n --arg i "$instance" '{instance: $i, action: "already_free", previous_owner: null}')"
+      else
+        echo "$instance was already free"
+      fi
       return 0
     fi
     if [ "$current_owner" != "$owner" ] && [ "$force" != "1" ]; then
       echo "ERROR: $instance is owned by $current_owner, not $owner. Use --force to override." >&2
+      if [ "$JSON_MODE" = "1" ]; then
+        jq -n \
+          --arg instance "$instance" \
+          --arg current_owner "$current_owner" \
+          --arg requesting_owner "$owner" \
+          '{ok: false, error: "owner_mismatch", denied: {instance: $instance, current_owner: $current_owner, requesting_owner: $requesting_owner}}'
+      fi
       return 2
     fi
     _do_release "$instance"
-    echo "released $instance (was owned by $current_owner)"
+    if [ "$JSON_MODE" = "1" ]; then
+      local action="released"
+      [ "$force" = "1" ] && [ "$current_owner" != "$owner" ] && action="force_released"
+      _emit_ok "$(jq -n \
+        --arg instance "$instance" \
+        --arg previous_owner "$current_owner" \
+        --arg action "$action" \
+        '{instance: $instance, previous_owner: $previous_owner, action: $action}')"
+    else
+      echo "released $instance (was owned by $current_owner)"
+    fi
   }
   with_lock _release_locked
 }
@@ -523,30 +709,23 @@ cmd_reap() {
   _reap_truncate_log
 
   _reap_log "=== reap finished: $cleared claims cleared, $killed orphans killed, $removed locks removed ==="
-  echo "reap complete: $cleared claims cleared, $killed Chromium orphans killed, $removed stale SingletonLocks removed"
-  echo "log: $REAP_LOG"
+  if [ "$JSON_MODE" = "1" ]; then
+    _emit_ok "$(jq -n \
+      --argjson cleared "$cleared" \
+      --argjson killed "$killed" \
+      --argjson removed "$removed" \
+      --arg log "$REAP_LOG" \
+      '{claims_cleared: $cleared, chromium_orphans_killed: $killed, stale_singletonlocks_removed: $removed, log: $log}')"
+  else
+    echo "reap complete: $cleared claims cleared, $killed Chromium orphans killed, $removed stale SingletonLocks removed"
+    echo "log: $REAP_LOG"
+  fi
 }
 
 cmd_doctor() {
-  echo "mcp-locks doctor"
-  echo "  state file:    $STATE_FILE"
-  if [ -f "$STATE_FILE" ]; then
-    local age_secs
-    age_secs=$(( $(date -u "+%s") - $(stat -f "%m" "$STATE_FILE" 2>/dev/null || echo 0) ))
-    echo "  state mtime:   $((age_secs / 60))m ago"
-  else
-    echo "  state mtime:   MISSING"
-  fi
-  echo "  registry:      $REGISTRY_FILE"
-  echo "  reap log:      $REAP_LOG"
-  echo ""
-
-  local total_claimed expired dead_pid
+  local total_claimed expired=0 dead_pid=0
   total_claimed=$(jq '.instances | to_entries | map(select(.value.owner != null)) | length' "$STATE_FILE")
-  echo "  active claims: $total_claimed"
 
-  expired=0
-  dead_pid=0
   while IFS=$'\x1f' read -r instance expires_at owner_pid; do
     [ -z "$instance" ] && continue
     local remaining
@@ -554,9 +733,6 @@ cmd_doctor() {
     [ "$remaining" -le 0 ] && expired=$((expired + 1))
     [ "$owner_pid" != "0" ] && ! is_alive "$owner_pid" && dead_pid=$((dead_pid + 1))
   done < <(jq -r '.instances | to_entries[] | select(.value.owner != null) | [.key, (.value.expires_at // ""), (.value.owner_pid // 0 | tostring)] | join("\u001f")' "$STATE_FILE")
-
-  echo "  expired:       $expired"
-  echo "  dead-PID:      $dead_pid"
 
   # Chromium-side checks. `pgrep` exits 1 when nothing matches; with pipefail
   # that would propagate through the pipeline and `set -e` would kill the
@@ -570,6 +746,46 @@ cmd_doctor() {
   # Also detect --isolated profile dirs (under /tmp per playwright/mcp >= 0.0.30)
   local isolated_count
   isolated_count=$( { pgrep -f 'playwright_chromiumdev_profile-' 2>/dev/null || true; } | wc -l | tr -d ' ')
+
+  local state_mtime_minutes=null
+  if [ -f "$STATE_FILE" ]; then
+    local age_secs
+    age_secs=$(( $(date -u "+%s") - $(stat -f "%m" "$STATE_FILE" 2>/dev/null || echo 0) ))
+    state_mtime_minutes=$((age_secs / 60))
+  fi
+
+  if [ "$JSON_MODE" = "1" ]; then
+    local reap_recommended=false
+    if [ "$expired" -gt 0 ] || [ "$dead_pid" -gt 0 ]; then reap_recommended=true; fi
+    _emit_ok "$(jq -n \
+      --arg state_file "$STATE_FILE" \
+      --arg registry_file "$REGISTRY_FILE" \
+      --arg reap_log "$REAP_LOG" \
+      --argjson state_mtime_minutes "$state_mtime_minutes" \
+      --argjson active_claims "$total_claimed" \
+      --argjson expired "$expired" \
+      --argjson dead_pid "$dead_pid" \
+      --argjson singletonlocks "$lock_count" \
+      --argjson chromium_pids "$chrome_count" \
+      --argjson isolated_pids "$isolated_count" \
+      --argjson reap_recommended "$reap_recommended" \
+      '{paths: {state_file: $state_file, registry_file: $registry_file, reap_log: $reap_log}, state_mtime_minutes: $state_mtime_minutes, active_claims: $active_claims, expired: $expired, dead_pid: $dead_pid, chromium: {singletonlocks_present: $singletonlocks, mcp_chrome_pids: $chromium_pids, isolated_pids: $isolated_pids}, reap_recommended: $reap_recommended}')"
+    return 0
+  fi
+
+  echo "mcp-locks doctor"
+  echo "  state file:    $STATE_FILE"
+  if [ -f "$STATE_FILE" ]; then
+    echo "  state mtime:   ${state_mtime_minutes}m ago"
+  else
+    echo "  state mtime:   MISSING"
+  fi
+  echo "  registry:      $REGISTRY_FILE"
+  echo "  reap log:      $REAP_LOG"
+  echo ""
+  echo "  active claims: $total_claimed"
+  echo "  expired:       $expired"
+  echo "  dead-PID:      $dead_pid"
   echo "  SingletonLocks:  $lock_count present (shared profile, pre-isolated)"
   echo "  mcp-chrome PIDs: $chrome_count running (shared profile, pre-isolated)"
   echo "  isolated PIDs:   $isolated_count running (--isolated profile dirs)"
@@ -585,13 +801,19 @@ usage() {
 mcp-locks — cross-client lock manager for MCP instances
 
 Usage:
-  mcp-locks list                                       # show all instances + owners
-  mcp-locks who <instance>                             # detail for one instance
-  mcp-locks claim <instance> [--owner ID] [--ttl 30m] [--note ...] [--force]
+  mcp-locks [--json] list                              # show all instances + owners
+  mcp-locks [--json] who <instance>                    # detail for one instance
+  mcp-locks [--json] claim <instance> [--owner ID] [--ttl 30m] [--note ...] [--force]
                                                        # acquire (or refresh) a lock
-  mcp-locks release <instance> [--owner ID] [--force]  # release a lock
-  mcp-locks reap                                       # clean up expired claims + orphans
-  mcp-locks doctor                                     # show health + recommend actions
+  mcp-locks [--json] release <instance> [--owner ID] [--force]  # release a lock
+  mcp-locks [--json] reap                              # clean up expired claims + orphans
+  mcp-locks [--json] doctor                            # show health + recommend actions
+
+Global flags:
+  --json    Emit a structured JSON envelope ({ok, data, error?}) on stdout
+            instead of human-readable output. Useful for programmatic callers
+            (MCP wrappers, scripts). Diagnostics still go to stderr; exit
+            codes are unchanged.
 
 Defaults:
   TTL:   ${DEFAULT_TTL}
@@ -611,6 +833,17 @@ Exit codes:
 Docs: https://github.com/mattbaylor/mcp-locks
 EOF
 }
+
+# Pre-parse: extract --json from anywhere in args before dispatch.
+# Supports both `mcp-locks --json list` and `mcp-locks list --json` forms.
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_MODE=1 ;;
+    *)      ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]}"
 
 case "${1:-}" in
   list)    shift; cmd_list "$@" ;;
