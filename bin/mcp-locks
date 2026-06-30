@@ -643,21 +643,42 @@ _reap_expired_and_dead() {
   echo "$cleared"
 }
 
+# Pattern matching both Playwright MCP Chromium profile dir conventions:
+#   - mcp-chrome-*                          (older shared-profile @playwright/mcp)
+#   - playwright_chromiumdev_profile-*      (current --isolated mode, /tmp/...)
+#
+# Used by both the orphan reaper (parent-dead Chromiums) and the `kill`
+# subcommand (which targets all matching Chromiums, optionally filtered).
+PLAYWRIGHT_CHROMIUM_PATTERN='mcp-chrome-|playwright_chromiumdev_profile-'
+
+# Kill a single PID with SIGTERM, escalating to SIGKILL after 0.5s. Returns 0
+# if the PID was alive and is now dead, 1 if it was already dead, 2 if kill
+# failed.
+_kill_pid() {
+  local pid="$1"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  kill "$pid" 2>/dev/null || true
+  sleep 0.5
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || return 2
+  fi
+  return 0
+}
+
 _reap_chromium_orphans() {
-  # Kill mcp-chrome-* Chromium processes whose parent is gone.
+  # Kill Playwright-MCP Chromium processes whose parent process is gone
+  # (PPID is 1 = init/launchd, or 0 = orphaned).
   local killed=0
   local pids
-  pids=$(pgrep -f 'mcp-chrome-' 2>/dev/null || true)
+  pids=$(pgrep -f "$PLAYWRIGHT_CHROMIUM_PATTERN" 2>/dev/null || true)
   for pid in $pids; do
     local ppid
     ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
     if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ]; then
-      # Parent is init/launchd or gone — orphaned.
-      if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        sleep 0.5
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-        _reap_log "killed orphan mcp-chrome PID $pid"
+      if _kill_pid "$pid"; then
+        _reap_log "killed orphan playwright-mcp chromium PID $pid"
         killed=$((killed + 1))
       fi
     fi
@@ -719,6 +740,143 @@ cmd_reap() {
   else
     echo "reap complete: $cleared claims cleared, $killed Chromium orphans killed, $removed stale SingletonLocks removed"
     echo "log: $REAP_LOG"
+  fi
+}
+
+# ---- cmd_kill ----
+#
+# Kill Playwright-MCP Chromium processes on demand. Targets matching the
+# PLAYWRIGHT_CHROMIUM_PATTERN profile-dir naming convention. Other instance
+# kinds (figma-desktop, future kinds) are not supported — see usage below.
+#
+# Modes:
+#   mcp-locks kill <instance>     # NOT IMPLEMENTED in v1 — requires slot→PID
+#                                 # tracking. Errors with a clear message.
+#                                 # Tracked: see vault followup for Mode B.
+#   mcp-locks kill --all          # Refuses unless --idle-only or --force.
+#                                 # Safety: prevents yanking a Chromium that
+#                                 # an in-flight tool call may be using.
+#   mcp-locks kill --all --idle-only
+#                                 # Kill Chromiums whose ancestor MCP server's
+#                                 # corresponding mcp-locks instance (best-
+#                                 # effort: not derivable from PIDs in v1, so
+#                                 # in v1 this is equivalent to checking
+#                                 # whether ANY instance is claimed; if none
+#                                 # are, kill all; if any are, kill none.)
+#   mcp-locks kill --all --force  # Kill every matching Chromium. Nuclear.
+#                                 # Use end-of-day or when you're sure
+#                                 # nothing is in flight.
+#   mcp-locks kill --orphans      # Same as the orphan portion of `reap`
+#                                 # (PPID=init/launchd). Exposed standalone
+#                                 # for cron / launchd / on-demand use.
+_kill_pids_of() {
+  # Find Chromium PIDs matching the playwright-mcp profile dir pattern.
+  pgrep -f "$PLAYWRIGHT_CHROMIUM_PATTERN" 2>/dev/null || true
+}
+
+cmd_kill() {
+  local instance="" all=0 idle_only=0 force=0 orphans_only=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all)        all=1; shift ;;
+      --idle-only)  idle_only=1; shift ;;
+      --force)      force=1; shift ;;
+      --orphans)    orphans_only=1; shift ;;
+      -*) echo "unknown flag: $1" >&2; return 1 ;;
+      *) if [ -z "$instance" ]; then instance="$1"; shift; else echo "unexpected arg: $1" >&2; return 1; fi ;;
+    esac
+  done
+
+  # ---- Per-instance kill (Mode B; not implemented in v1) ----
+  if [ -n "$instance" ]; then
+    # v1 limitation: profile-dir names are random and the running MCP server
+    # process command line doesn't encode the slot name (opencode passes a
+    # generic command). Targeted kill requires tracking PIDs at claim time,
+    # which is a separate, larger change.
+    local msg="per-instance kill is not implemented in v1. Use --all (with --idle-only or --force) for bulk cleanup. See https://github.com/mattbaylor/mcp-locks/issues for the per-instance tracking design."
+    echo "ERROR: $msg" >&2
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_err "$msg"
+    fi
+    return 1
+  fi
+
+  # ---- Orphans-only mode (subset of reap) ----
+  if [ "$orphans_only" = "1" ]; then
+    if [ "$all" = "1" ] || [ "$idle_only" = "1" ] || [ "$force" = "1" ]; then
+      local msg="--orphans is mutually exclusive with --all/--idle-only/--force"
+      echo "ERROR: $msg" >&2
+      [ "$JSON_MODE" = "1" ] && _emit_err "$msg"
+      return 1
+    fi
+    _reap_log "=== kill --orphans ==="
+    local killed
+    killed=$(_reap_chromium_orphans)
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_ok "$(jq -n --argjson killed "$killed" --arg mode "orphans" \
+        '{mode: $mode, killed: $killed}')"
+    else
+      echo "killed $killed orphaned playwright-mcp Chromium(s)"
+    fi
+    return 0
+  fi
+
+  # ---- Require --all (with a safety flag) ----
+  if [ "$all" != "1" ]; then
+    local msg="missing target. Use one of: kill <instance> (not impl v1), kill --orphans, kill --all --idle-only, kill --all --force"
+    echo "ERROR: $msg" >&2
+    [ "$JSON_MODE" = "1" ] && _emit_err "$msg"
+    return 1
+  fi
+  if [ "$idle_only" != "1" ] && [ "$force" != "1" ]; then
+    local msg="kill --all requires --idle-only (safe) or --force (nuclear). Aborting."
+    echo "ERROR: $msg" >&2
+    [ "$JSON_MODE" = "1" ] && _emit_err "$msg"
+    return 1
+  fi
+
+  # ---- --all --idle-only: refuse if anything is claimed ----
+  if [ "$idle_only" = "1" ]; then
+    local active
+    active=$(jq '[.instances[] | select(.owner != null)] | length' "$STATE_FILE")
+    if [ "$active" -gt 0 ]; then
+      local msg="--idle-only refused: $active instance(s) currently claimed. Use --force to override (will yank in-flight Chromiums), or wait for claims to release."
+      echo "ERROR: $msg" >&2
+      if [ "$JSON_MODE" = "1" ]; then
+        jq -n --argjson active "$active" --arg mode "idle-only" \
+          '{ok: false, error: "instances_claimed", mode: $mode, active_claims: $active}'
+      fi
+      return 2
+    fi
+  fi
+
+  # ---- Execute the kill ----
+  _reap_log "=== kill --all $([ "$force" = "1" ] && echo "--force" || echo "--idle-only") ==="
+  local pids killed=0 attempted=0 mode="idle-only"
+  [ "$force" = "1" ] && mode="force"
+  pids=$(_kill_pids_of)
+  if [ -z "$pids" ]; then
+    if [ "$JSON_MODE" = "1" ]; then
+      _emit_ok "$(jq -n --arg mode "$mode" \
+        '{mode: $mode, killed: 0, attempted: 0, message: "no matching Chromium processes found"}')"
+    else
+      echo "no matching playwright-mcp Chromium processes running"
+    fi
+    return 0
+  fi
+  for pid in $pids; do
+    attempted=$((attempted + 1))
+    if _kill_pid "$pid"; then
+      _reap_log "killed playwright-mcp Chromium PID $pid (kill --all --$mode)"
+      killed=$((killed + 1))
+    fi
+  done
+
+  if [ "$JSON_MODE" = "1" ]; then
+    _emit_ok "$(jq -n --argjson killed "$killed" --argjson attempted "$attempted" --arg mode "$mode" \
+      '{mode: $mode, killed: $killed, attempted: $attempted}')"
+  else
+    echo "killed $killed of $attempted matching playwright-mcp Chromium process(es) (--$mode)"
   fi
 }
 
@@ -808,6 +966,9 @@ Usage:
   mcp-locks [--json] release <instance> [--owner ID] [--force]  # release a lock
   mcp-locks [--json] reap                              # clean up expired claims + orphans
   mcp-locks [--json] doctor                            # show health + recommend actions
+  mcp-locks [--json] kill --orphans                    # kill orphaned playwright-mcp Chromiums
+  mcp-locks [--json] kill --all --idle-only            # kill all playwright-mcp Chromiums IFF no instance is claimed
+  mcp-locks [--json] kill --all --force                # kill all playwright-mcp Chromiums (nuclear)
 
 Global flags:
   --json    Emit a structured JSON envelope ({ok, data, error?}) on stdout
@@ -852,6 +1013,7 @@ case "${1:-}" in
   release) shift; cmd_release "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
+  kill)    shift; cmd_kill "$@" ;;
   -h|--help|help|"") usage ;;
   *) echo "unknown subcommand: $1" >&2; usage; exit 1 ;;
 esac
